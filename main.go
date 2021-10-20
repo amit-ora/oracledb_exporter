@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"errors"
 	"hash"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"strconv"
@@ -25,8 +27,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/log"
 	"gopkg.in/alecthomas/kingpin.v2"
+	"gopkg.in/yaml.v2"
 	//Required for debugging
 	//_ "net/http/pprof"
+	"github.com/oracle/oci-go-sdk/v49/common/auth"
+	"github.com/oracle/oci-go-sdk/v49/common"
+	"github.com/oracle/oci-go-sdk/v49/vault"
+	"encoding/base64"
 )
 
 var (
@@ -42,6 +49,8 @@ var (
 	securedMetrics     = kingpin.Flag("web.secured-metrics", "Expose metrics using https.").Default("false").Bool()
 	serverCert         = kingpin.Flag("web.ssl-server-cert", "Path to the PEM encoded certificate").ExistingFile()
 	serverKey          = kingpin.Flag("web.ssl-server-key", "Path to the PEM encoded key").ExistingFile()
+	authconfig         = kingpin.Flag("auth.config", "Configuration file of http authentication. (env: AUTH_CONFIG").Default(getEnv("AUTH_CONFIG", "auth_config.yml")).String()
+	dockerpath         = "/run/secrets/"
 )
 
 // Metric name parts.
@@ -534,6 +543,120 @@ func reloadMetrics() {
 	}
 }
 
+type authinfo struct {
+	Username string
+	Password string
+}
+
+func (auth *authinfo) setupAuthConfig() {
+	// step1: read from config file
+	authConfigYamlFile, err := ioutil.ReadFile(*authconfig)
+	if err != nil {
+		log.Errorln(err)
+	}
+	err = yaml.Unmarshal(authConfigYamlFile, auth)
+	if err != nil {
+		log.Errorln(err)
+	}
+	// step2: read from docker secret
+	usrname_file := dockerpath + auth.Username
+	password_file := dockerpath + auth.Password
+	if _, err := os.Stat(usrname_file); err == nil {
+		if temp, err := ioutil.ReadFile(usrname_file); err == nil {
+			auth.Username = string(temp[:len(temp)-1])
+		} else {
+			log.Errorln(err)
+		}
+	} else {
+		log.Errorln(err)
+	}
+
+	if _, err := os.Stat(password_file); err == nil {
+		if temp, err := ioutil.ReadFile(password_file); err == nil {
+			auth.Password = string(temp[:len(temp)-1])
+		} else {
+			log.Errorln(err)
+		}
+	} else {
+		log.Errorln(err)
+	}
+}
+
+func (auth *authinfo) basicAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		username, password, ok := r.BasicAuth()
+		if ok {
+			usernameHash := sha256.Sum256([]byte(username))
+			passwordHash := sha256.Sum256([]byte(password))
+			expectedUsernameHash := sha256.Sum256([]byte(auth.Username))
+			expectedPasswordHash := sha256.Sum256([]byte(auth.Password))
+
+			usernameMatch := (subtle.ConstantTimeCompare(usernameHash[:], expectedUsernameHash[:]) == 1)
+			passwordMatch := (subtle.ConstantTimeCompare(passwordHash[:], expectedPasswordHash[:]) == 1)
+
+			if usernameMatch && passwordMatch {
+				log.Infoln("Authentication Success!")
+				next.ServeHTTP(w, r)
+				return
+			} else {
+				log.Errorln("Unmatched password or username of the http authentication")
+			}
+		}
+		log.Errorln("Unauthorized and restricted")
+		w.Header().Set("WWW-Authenticate", `Basic realm="restricted", charset="UTF-8"`)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+	})
+}
+
+func setUpDSN() string {
+    dsn_secret_from_vault := getSecretFromVault()
+    if(dsn_secret_from_vault != "" ) {
+        return dsn_secret_from_vault
+    }
+	dsn_secret_file := dockerpath + os.Getenv("DATA_SOURCE_NAME")
+	// dsn_secret_file := "/" + os.Getenv("DATA_SOURCE_NAME")
+	if _, err := os.Stat(dsn_secret_file); err == nil {
+		if temp, err := ioutil.ReadFile(dsn_secret_file); err == nil {
+			return string(temp[:len(temp)-1])
+		} else {
+			log.Errorln(err)
+		}
+	} else {
+		log.Errorln(err)
+	}
+	return os.Getenv("DATA_SOURCE_NAME")
+}
+
+func getSecretFromVault() string {
+    vault_secret_ocid := os.Getenv("VAULT_SECRET_OCID") // eg ocid1.compartment.oc1..aaaaaaaasqkh32mmf4zt5j6plkm4l4rdjli3vhtdfmfkmna3nyskui6kcqnq
+    if (vault_secret_ocid == "") {
+        return ""
+    }
+    oci_region := os.Getenv("OCI_REGION") //eg "us-ashburn-1" ie common.RegionIAD
+    if (oci_region == "") {
+        return ""
+    }
+	instancePrincipalConfigurationProvider, err := auth.InstancePrincipalConfigurationProviderForRegion(common.RegionIAD)
+	client, err := vault.NewVaultsClientWithConfigurationProvider(instancePrincipalConfigurationProvider)
+	if err != nil {
+		fmt.Printf("failed to create client err = %s", err)
+		return ""
+	}
+    req := vault.GetSecretRequest{SecretId: common.String("ocid1.vaultsecret.oc1.iad.amaaaaaa55avruqaollb43ogvcksuf5tlxy6rxstmggtpp7b5rmjprcjcjmq")}
+    resp, err := client.GetSecret(context.Background(), req)
+	if err != nil {
+		fmt.Printf("failed to create resp err = %s", err)
+		return ""
+	}
+	fmt.Println(resp)
+	secretValue, err := base64.StdEncoding.DecodeString(resp.Secret.String())
+	if err != nil {
+		fmt.Printf("failed to decode err = %s", err)
+		return ""
+	}
+	return string(secretValue)
+}
+
 func main() {
 	log.AddFlags(kingpin.CommandLine)
 	kingpin.Version("oracledb_exporter " + Version)
@@ -541,7 +664,8 @@ func main() {
 	kingpin.Parse()
 
 	log.Infoln("Starting oracledb_exporter " + Version)
-	dsn := os.Getenv("DATA_SOURCE_NAME")
+	// dsn := os.Getenv("DATA_SOURCE_NAME")
+	dsn := setUpDSN()
 
 	// Load default and custom metrics
 	hashMap = make(map[int][]byte)
@@ -552,10 +676,13 @@ func main() {
 
 	// See more info on https://github.com/prometheus/client_golang/blob/master/prometheus/promhttp/http.go#L269
 	opts := promhttp.HandlerOpts{
-		ErrorLog: log.NewErrorLogger(),
+		ErrorLog:      log.NewErrorLogger(),
 		ErrorHandling: promhttp.ContinueOnError,
 	}
-	http.Handle(*metricPath, promhttp.HandlerFor(prometheus.DefaultGatherer, opts))
+
+	dbuser := new(authinfo)
+	dbuser.setupAuthConfig()
+	http.Handle(*metricPath, dbuser.basicAuth(promhttp.HandlerFor(prometheus.DefaultGatherer, opts)))
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("<html><head><title>Oracle DB Exporter " + Version + "</title></head><body><h1>Oracle DB Exporter " + Version + "</h1><p><a href='" + *metricPath + "'>Metrics</a></p></body></html>"))
