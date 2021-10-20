@@ -28,12 +28,14 @@ import (
 	"github.com/prometheus/common/log"
 	"gopkg.in/alecthomas/kingpin.v2"
 	"gopkg.in/yaml.v2"
+
 	//Required for debugging
 	//_ "net/http/pprof"
-	"github.com/oracle/oci-go-sdk/v49/common/auth"
-	"github.com/oracle/oci-go-sdk/v49/common"
-	"github.com/oracle/oci-go-sdk/v49/vault"
 	"encoding/base64"
+
+	"github.com/oracle/oci-go-sdk/v49/common"
+	"github.com/oracle/oci-go-sdk/v49/common/auth"
+	"github.com/oracle/oci-go-sdk/v49/vault"
 )
 
 var (
@@ -609,10 +611,10 @@ func (auth *authinfo) basicAuth(next http.Handler) http.Handler {
 }
 
 func setUpDSN() string {
-    dsn_secret_from_vault := getSecretFromVault()
-    if(dsn_secret_from_vault != "" ) {
-        return dsn_secret_from_vault
-    }
+	dsn_secret_from_vault := getSecretFromVault()
+	if dsn_secret_from_vault != "" {
+		return dsn_secret_from_vault
+	}
 	dsn_secret_file := dockerpath + os.Getenv("DATA_SOURCE_NAME")
 	// dsn_secret_file := "/" + os.Getenv("DATA_SOURCE_NAME")
 	if _, err := os.Stat(dsn_secret_file); err == nil {
@@ -628,22 +630,22 @@ func setUpDSN() string {
 }
 
 func getSecretFromVault() string {
-    vault_secret_ocid := os.Getenv("VAULT_SECRET_OCID") // eg ocid1.compartment.oc1..aaaaaaaasqkh32mmf4zt5j6plkm4l4rdjli3vhtdfmfkmna3nyskui6kcqnq
-    if (vault_secret_ocid == "") {
-        return ""
-    }
-    oci_region := os.Getenv("OCI_REGION") //eg "us-ashburn-1" ie common.RegionIAD
-    if (oci_region == "") {
-        return ""
-    }
+	vault_secret_ocid := os.Getenv("VAULT_SECRET_OCID") // eg ocid1.compartment.oc1..aaaaaaaasqkh32mmf4zt5j6plkm4l4rdjli3vhtdfmfkmna3nyskui6kcqnq
+	if vault_secret_ocid == "" {
+		return ""
+	}
+	oci_region := os.Getenv("OCI_REGION") //eg "us-ashburn-1" ie common.RegionIAD
+	if oci_region == "" {
+		return ""
+	}
 	instancePrincipalConfigurationProvider, err := auth.InstancePrincipalConfigurationProviderForRegion(common.RegionIAD)
 	client, err := vault.NewVaultsClientWithConfigurationProvider(instancePrincipalConfigurationProvider)
 	if err != nil {
 		fmt.Printf("failed to create client err = %s", err)
 		return ""
 	}
-    req := vault.GetSecretRequest{SecretId: common.String("ocid1.vaultsecret.oc1.iad.amaaaaaa55avruqaollb43ogvcksuf5tlxy6rxstmggtpp7b5rmjprcjcjmq")}
-    resp, err := client.GetSecret(context.Background(), req)
+	req := vault.GetSecretRequest{SecretId: common.String("ocid1.vaultsecret.oc1.iad.amaaaaaa55avruqaollb43ogvcksuf5tlxy6rxstmggtpp7b5rmjprcjcjmq")}
+	resp, err := client.GetSecret(context.Background(), req)
 	if err != nil {
 		fmt.Printf("failed to create resp err = %s", err)
 		return ""
